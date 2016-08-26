@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# Generate a minimal filesystem for archlinux and load it into the local
-# docker as "archlinux"
+# Generate a minimal filesystem for archlinux as a tarball
 # requires root
 set -e
 
-_TARNAME="archbase64-$(date +%Y.%m.%d)"
 hash pacstrap &>/dev/null || {
 	echo "Could not find pacstrap. Run pacman -S arch-install-scripts"
 	exit 1
@@ -16,12 +14,10 @@ hash expect &>/dev/null || {
 }
 
 export LANG="C.UTF-8"
+export _IMAGE_ARCH="${1:-$(uname -m)}"
 
 ROOTFS=$(mktemp -d ${TMPDIR:-/var/tmp}/rootfs-archlinux-XXXXXXXXXX)
-
-trap 'umount -R "$ROOTFS/*" 2>&1 >/dev/null ; rm -fr "$ROOTFS"' EXIT INT TERM
-
-chmod 755 $ROOTFS
+chmod 755 "$ROOTFS"
 
 # packages to ignore for space savings
 PKGIGNORE=(
@@ -53,15 +49,48 @@ IFS=','
 PKGIGNORE="${PKGIGNORE[*]}"
 unset IFS
 
+case "$_IMAGE_ARCH" in
+	armv*)
+		if pacman -Q archlinuxarm-keyring >/dev/null 2>&1; then
+			pacman-key --init
+			pacman-key --populate archlinuxarm
+		else
+			echo "Could not find archlinuxarm-keyring. Please, install it and run pacman-key --populate archlinuxarm"
+			exit 1
+		fi
+		PACMAN_CONF='./mkimage-archarm-pacman.conf'
+		PACMAN_MIRRORLIST='Server = http://mirror.archlinuxarm.org/$arch/$repo'
+		PACMAN_EXTRA_PKGS='archlinuxarm-keyring'
+		EXPECT_TIMEOUT=120
+		ARCH_KEYRING=archlinuxarm
+		DOCKER_IMAGE_NAME=archlinuxarm
+		;;
+	*)
+		PACMAN_CONF='./mkimage-arch-pacman.conf'
+		PACMAN_MIRRORLIST="Server = https://mirrors.kernel.org/archlinux/\$repo/os/${_IMAGE_ARCH}"
+		PACMAN_EXTRA_PKGS=''
+		EXPECT_TIMEOUT=60
+		ARCH_KEYRING=archlinux
+		DOCKER_IMAGE_NAME=archlinux:latest
+		;;
+esac
+
+export PACMAN_MIRRORLIST
+
+# override Architecture in pacman configuration
+sed -i "s/Architecture\\s*=.*/Architecture = ${_IMAGE_ARCH}/" "${PACMAN_CONF}"
+# tarball shall include architecture and build date
+_TARNAME="archbase-${_IMAGE_ARCH}-$(date +%Y.%m.%d)"
+
 expect <<EOF
 	set send_slow {1 .1}
 	proc send {ignore arg} {
 		sleep .1
 		exp_send -s -- \$arg
 	}
-	set timeout 60
+	set timeout $EXPECT_TIMEOUT
 
-	spawn pacstrap -C ./mkimage-arch-pacman.conf -c -d -G -i $ROOTFS base haveged --ignore $PKGIGNORE
+	spawn pacstrap -C $PACMAN_CONF -c -d -G -i "$ROOTFS" base haveged $PACMAN_EXTRA_PKGS --ignore $PKGIGNORE
 	expect {
 		-exact "anyway? \[Y/n\] " { send -- "n\r"; exp_continue }
 		-exact "(default=all): " { send -- "\r"; exp_continue }
@@ -70,14 +99,14 @@ expect <<EOF
 EOF
 
 arch-chroot "$ROOTFS" /bin/sh -c 'rm -r /usr/share/man/*'
-arch-chroot "$ROOTFS" /bin/sh -c "haveged -w 1024; pacman-key --init; pkill haveged; pacman -Rs --noconfirm haveged; pacman-key --populate archlinux; pkill gpg-agent"
+arch-chroot "$ROOTFS" /bin/sh -c "haveged -w 1024; pacman-key --init; pkill haveged; pacman -Rs --noconfirm haveged; pacman-key --populate $ARCH_KEYRING; pkill gpg-agent"
 arch-chroot "$ROOTFS" /bin/sh -c "ln -s /usr/share/zoneinfo/UTC /etc/localtime"
-echo 'en_US.UTF-8 UTF-8' > "$ROOTFS/etc/locale.gen"
+echo 'en_US.UTF-8 UTF-8' > "$ROOTFS"/etc/locale.gen
 arch-chroot "$ROOTFS" locale-gen
-arch-chroot "$ROOTFS" /bin/sh -c 'echo "Server = https://mirrors.kernel.org/archlinux/\$repo/os/\$arch" > /etc/pacman.d/mirrorlist'
+arch-chroot "$ROOTFS" /bin/sh -c 'echo $PACMAN_MIRRORLIST > /etc/pacman.d/mirrorlist'
 
 # udev doesn't work in containers, rebuild /dev
-DEV="$ROOTFS/dev"
+DEV="$ROOTFS"/dev
 rm -rf "$DEV"
 mkdir -p "$DEV"
 mknod -m 666 "$DEV"/null c 1 3
@@ -94,4 +123,6 @@ mknod -m 600 "$DEV"/initctl p
 mknod -m 666 "$DEV"/ptmx c 5 2
 ln -sf /proc/self/fd "$DEV"/fd
 
-tar --numeric-owner --xattrs --acls -C "$ROOTFS" -c . | pv | bzip2 -c > "$_TARNAME".tar.bz2
+printf -- "Packaging $ROOTFS in $_TARNAME\n"
+tar --numeric-owner --xattrs --acls -C "$ROOTFS" -c . | bzip2 -c > "$_TARNAME".tar.bz2
+rm -fr "$ROOTFS"
